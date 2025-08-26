@@ -3,12 +3,34 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>3D FPS Target Practice</title>
-  <link rel="stylesheet" href="style.css" />
+  <title>3D FPS Target Practice — Single File</title>
+  <style>
+    /* -- Inline CSS (from starter) -- */
+    html,body{
+      margin:0;height:100%;overflow:hidden;
+      font-family:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial;
+      background:#111;color:#eee;
+    }
+    canvas{display:block;width:100vw;height:100vh;}
+    #overlay{
+      position:absolute;left:12px;top:12px;z-index:10;
+      background:rgba(0,0,0,0.45);padding:12px;border-radius:8px;
+      backdrop-filter:blur(3px);max-width:420px;
+    }
+    .controls-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;}
+    .controls-row label{font-size:14px;}
+    .controls-row button{padding:8px 12px;cursor:pointer;}
+    .hint{font-size:12px;opacity:0.9;margin:8px 0;}
+    .hud-row{display:flex;gap:18px;margin-top:8px;font-weight:600;}
+    .message{margin-top:8px;font-size:14px;color:#ffd;}
+    #score,#timer,#lives{font-family:monospace;}
+    /* reticle fallback for small screens */
+    @media (max-width:420px){ #overlay{left:8px;right:8px;top:8px;} }
+  </style>
 </head>
 <body>
   <div id="overlay">
-    <h1>FPS Target Practice</h1>
+    <h1 style="margin:0 0 8px 0;font-size:18px;">FPS Target Practice</h1>
 
     <div class="controls-row">
       <label>Gamemode:
@@ -26,7 +48,8 @@
       <button id="startBtn">Start Game</button>
     </div>
 
-    <p class="hint">Click the canvas (or press Start) to lock the pointer. Left click to shoot.</p>
+    <p class="hint">Click Start (or the canvas) to lock pointer. WASD to move, mouse to look, left click to shoot.</p>
+
     <div class="hud-row">
       <div>Score: <span id="score">0</span></div>
       <div id="timerWrap">Time: <span id="timer">60</span>s</div>
@@ -38,6 +61,284 @@
 
   <canvas id="c"></canvas>
 
-  <script type="module" src="main.js"></script>
+  <script type="module">
+    // -- Single-file JS (imports Three.js + PointerLockControls from unpkg) --
+    import * as THREE from 'https://unpkg.com/three@0.154.0/build/three.module.js';
+    import { PointerLockControls } from 'https://unpkg.com/three@0.154.0/examples/jsm/controls/PointerLockControls.js';
+
+    // DOM
+    const canvas = document.getElementById('c');
+    const scoreEl = document.getElementById('score');
+    const timerEl = document.getElementById('timer');
+    const timerWrap = document.getElementById('timerWrap');
+    const livesEl = document.getElementById('lives');
+    const livesWrap = document.getElementById('livesWrap');
+    const messageEl = document.getElementById('message');
+    const startBtn = document.getElementById('startBtn');
+    const gamemodeSel = document.getElementById('gamemode');
+    const difficultyEl = document.getElementById('difficulty');
+
+    // THREE basic setup
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x87ceeb);
+    const camera = new THREE.PerspectiveCamera(75, innerWidth/innerHeight, 0.1, 2000);
+    camera.position.set(0,1.6,5);
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias:true });
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    window.addEventListener('resize', () => {
+      camera.aspect = innerWidth/innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+    });
+
+    // Lighting & floor
+    scene.add(new THREE.HemisphereLight(0xffffff,0x444444,1.2));
+    const dir = new THREE.DirectionalLight(0xffffff,0.7);
+    dir.position.set(5,10,2); scene.add(dir);
+    const floor = new THREE.Mesh(new THREE.PlaneGeometry(200,200), new THREE.MeshStandardMaterial({ color:0x555555 }));
+    floor.rotation.x = -Math.PI/2; floor.position.y = 0; scene.add(floor);
+
+    // Controls (Pointer Lock)
+    const controls = new PointerLockControls(camera, document.body);
+
+    // Movement keys
+    const keys = { w:false, a:false, s:false, d:false };
+    window.addEventListener('keydown', (e) => {
+      if (e.code === 'KeyW') keys.w = true;
+      if (e.code === 'KeyS') keys.s = true;
+      if (e.code === 'KeyA') keys.a = true;
+      if (e.code === 'KeyD') keys.d = true;
+    });
+    window.addEventListener('keyup', (e) => {
+      if (e.code === 'KeyW') keys.w = false;
+      if (e.code === 'KeyS') keys.s = false;
+      if (e.code === 'KeyA') keys.a = false;
+      if (e.code === 'KeyD') keys.d = false;
+    });
+
+    // HUD & state
+    let mode = 'practice';
+    let difficulty = 1;
+    let score = 0;
+    let timer = 60;
+    let lives = 3;
+    let running = false;
+    let lastSpawn = 0;
+    let spawnInterval = 1500;
+    const clock = new THREE.Clock(false);
+
+    // Targets container
+    let targets = [];
+    const targetGroup = new THREE.Group();
+    scene.add(targetGroup);
+
+    // Raycaster for shooting
+    const raycaster = new THREE.Raycaster();
+
+    // Create a simple CSS reticle
+    const reticle = document.createElement('div');
+    Object.assign(reticle.style, {
+      position:'absolute', left:'50%', top:'50%', width:'10px', height:'10px',
+      marginLeft:'-5px', marginTop:'-5px', border:'2px solid rgba(255,255,255,0.9)',
+      borderRadius:'50%', zIndex:5, pointerEvents:'none'
+    });
+    document.body.appendChild(reticle);
+
+    // Helpers
+    function spawnTarget(type='static') {
+      const size = THREE.MathUtils.lerp(0.25, 0.6, Math.random());
+      const geo = new THREE.SphereGeometry(size, 12, 12);
+      const mat = new THREE.MeshStandardMaterial({ color: new THREE.Color().setHSL(Math.random(), 0.7, 0.5), metalness:0.2, roughness:0.6 });
+      const mesh = new THREE.Mesh(geo, mat);
+      const angle = THREE.MathUtils.degToRad(THREE.MathUtils.randFloatSpread(90));
+      const distance = THREE.MathUtils.randFloat(6, 22);
+      const x = Math.sin(angle) * distance + camera.position.x + (Math.random()-0.5)*6;
+      const z = -Math.cos(angle) * distance + camera.position.z + (Math.random()-0.5)*6;
+      const y = THREE.MathUtils.randFloat(1.0, 3.0);
+      mesh.position.set(x,y,z);
+      mesh.userData = { type, size, hit:false, speed: THREE.MathUtils.randFloat(0.5, 1.2) };
+      targetGroup.add(mesh);
+      targets.push(mesh);
+    }
+
+    function destroyTarget(t) {
+      const idx = targets.indexOf(t);
+      if (idx !== -1) targets.splice(idx,1);
+      if (t.geometry) t.geometry.dispose();
+      if (t.material) {
+        if (Array.isArray(t.material)) t.material.forEach(m => m.dispose());
+        else t.material.dispose();
+      }
+      targetGroup.remove(t);
+    }
+
+    function clearAllTargets() {
+      for (let t of [...targets]) destroyTarget(t);
+      targets = [];
+    }
+
+    // Shooting
+    function shoot() {
+      if (!running) return;
+      raycaster.setFromCamera(new THREE.Vector2(0,0), camera);
+      const intersects = raycaster.intersectObjects(targets, false);
+      if (intersects.length > 0) {
+        const hit = intersects[0].object;
+        score += 1;
+        scoreEl.textContent = score;
+        // quick pop: scale then remove
+        hit.scale.setScalar(hit.scale.x * 1.5);
+        setTimeout(()=> {
+          if (targets.includes(hit)) destroyTarget(hit);
+        }, 120);
+      }
+    }
+
+    window.addEventListener('mousedown', (e) => {
+      if (e.button === 0) shoot();
+    });
+
+    // Movement update
+    function updateMovement(dt) {
+      const speed = 4.5;
+      const move = new THREE.Vector3();
+      if (keys.w) move.z -= 1;
+      if (keys.s) move.z += 1;
+      if (keys.a) move.x -= 1;
+      if (keys.d) move.x += 1;
+      if (move.lengthSq() > 0) {
+        move.normalize();
+        // camera matrix elements for forward/right on XZ plane
+        const e = camera.matrix.elements;
+        const forward = new THREE.Vector3(-e[8], 0, -e[10]).normalize();
+        const right = new THREE.Vector3(e[0], 0, e[2]).normalize();
+        const dir = forward.multiplyScalar(move.z).add(right.multiplyScalar(move.x));
+        camera.position.addScaledVector(dir, speed * dt);
+      }
+    }
+
+    // Targets update (movement and collisions)
+    function updateTargets(dt) {
+      for (let i = targets.length - 1; i >= 0; --i) {
+        const t = targets[i];
+        if (!t) continue;
+        if (t.userData.type === 'moving') {
+          const dir = new THREE.Vector3().subVectors(camera.position, t.position);
+          const dist = dir.length();
+          if (dist < 1.4) {
+            destroyTarget(t);
+            lives--;
+            livesEl.textContent = lives;
+            if (lives <= 0) endGame('You were overwhelmed!');
+            continue;
+          }
+          dir.normalize();
+          t.position.addScaledVector(dir, t.userData.speed * dt);
+        } else {
+          t.position.y += Math.sin(performance.now()*0.001 + i) * 0.0005;
+        }
+        if (t.position.distanceTo(camera.position) > 250) destroyTarget(t);
+      }
+    }
+
+    // Game loop
+    function animate() {
+      requestAnimationFrame(animate);
+      const dt = clock.getDelta();
+      if (running) {
+        const now = performance.now();
+        if (now - lastSpawn > spawnInterval) {
+          lastSpawn = now;
+          const count = difficulty;
+          for (let i=0;i<count;i++){
+            const type = (mode === 'survival' && Math.random() < 0.6) ? 'moving' : 'static';
+            spawnTarget(type);
+          }
+        }
+
+        if (mode === 'timed') {
+          timer -= dt;
+          timerEl.textContent = Math.max(0, Math.floor(timer));
+          if (timer <= 0) endGame('Time up!');
+        }
+
+        updateTargets(dt);
+        updateMovement(dt);
+      }
+
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    // Start / end game functions
+    function startGame() {
+      // reset
+      score = 0; scoreEl.textContent = score;
+      clearAllTargets();
+      mode = gamemodeSel.value;
+      difficulty = parseInt(difficultyEl.value, 10) || 1;
+      spawnInterval = 1700 / difficulty;
+
+      if (mode === 'timed') {
+        timer = 60;
+        timerWrap.style.display = 'inline';
+        livesWrap.style.display = 'none';
+      } else if (mode === 'survival') {
+        lives = 3 + (3 - difficulty); // easier difficulty gives more lives
+        livesEl.textContent = lives;
+        timerWrap.style.display = 'none';
+        livesWrap.style.display = 'inline';
+      } else {
+        timerWrap.style.display = 'none';
+        livesWrap.style.display = 'none';
+      }
+
+      messageEl.textContent = '';
+      running = true;
+      lastSpawn = performance.now();
+      clock.start();
+
+      // Pointer lock must be triggered by a user gesture (this click qualifies)
+      controls.lock();
+    }
+
+    function endGame(msg) {
+      running = false;
+      messageEl.textContent = `${msg} — Score: ${score}`;
+      controls.unlock();
+      clock.stop();
+    }
+
+    // UI hookups
+    startBtn.addEventListener('click', startGame);
+    gamemodeSel.addEventListener('change', (e) => { mode = e.target.value; });
+    difficultyEl.addEventListener('input', (e) => {
+      difficulty = parseInt(e.target.value,10);
+      spawnInterval = 1700 / difficulty;
+    });
+
+    // Provide small hint if pointer lock unsupported
+    if (!('pointerLockElement' in document || 'mozPointerLockElement' in document)) {
+      messageEl.textContent = 'Warning: Pointer Lock API may not be supported in this browser.';
+    }
+
+    // If user clicks canvas, also lock pointer (another gesture)
+    canvas.addEventListener('click', () => {
+      if (!controls.isLocked) controls.lock();
+    });
+
+    // Extra: show/hide overlay message when locked/unlocked
+    controls.addEventListener('lock', () => {
+      // optional: reduce overlay opacity or hide
+      // document.getElementById('overlay').style.opacity = '0.6';
+    });
+    controls.addEventListener('unlock', () => {
+      // document.getElementById('overlay').style.opacity = '1';
+    });
+
+    // Friendly console tip
+    console.log('3D FPS Target Practice loaded — click Start to begin.');
+  </script>
 </body>
 </html>
